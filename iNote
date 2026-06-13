@@ -1,0 +1,194 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+/// @title EncryptedNotes (envelope edition)
+/// @notice Stores encrypted notes and one "vault" per address — a wrapped master key.
+///         The contract does NOT encrypt and does NOT know the wallet type.
+///         All crypto happens client-side.
+///         The goal is to encrypt the note TEXT. The fact that a note exists, its
+///         author, size and creation time are public — this is by design, not a bug.
+///         mode is only a hint for the frontend on how to unwrap the vault.
+///           Signature  — wrapping key derived from an EOA signature (MetaMask-like wallets).
+///           Passphrase — wrapping key derived from a password (smart wallets, where a
+///                        deterministic ECDSA signature over a fixed message may not exist).
+///                        This is a tradeoff: the envelope is public => a weak password
+///                        means offline brute-force is possible. Client's choice.
+///         WARNING: deleteNote only removes the ciphertext from the CURRENT state. In the
+///         transaction history (calldata) it remains forever. "Right to be forgotten" is
+///         not possible here.
+contract EncryptedNotes {
+    /// 0 = not initialized, 1 = from signature (EOA), 2 = from passphrase (smart wallet)
+    enum KeyMode { Unset, Signature, Passphrase }
+
+    struct Note {
+        uint64 createdAt;
+        bool   hidden;      // cosmetic flag for the frontend (does NOT hide data)
+        bool   deleted;     // data has been wiped from current state
+        bytes  data;        // iv(12) + AES-GCM(ciphertext+tag), encrypted with the master key
+    }
+
+    struct Vault {
+        KeyMode mode;       // }
+        uint32  version;    // } all packed into a single slot (1+4+8+8 = 21 bytes)
+        uint64  createdAt;  // }
+        uint64  updatedAt;  // }
+        bytes   envelope;   // iv(12) + AES-GCM(master key) — the wrapped master key
+    }
+
+    uint256 public constant MAX_NOTE_BYTES     = 8192;
+    uint256 public constant MAX_ENVELOPE_BYTES = 512;   // 32-byte key + iv + tag — with margin
+    uint256 public constant MAX_PAGE           = 100;   // page cap for onchain calls
+
+    mapping(address => Note[]) private _notes;
+    mapping(address => Vault)  private _vaults;
+
+    uint256 public totalNotes;   // cumulative total created (does not decrease on delete)
+    uint256 public totalUsers;
+
+    // ---- errors ----
+    error VaultExists();
+    error NoVault();
+    error BadMode();
+    error BadEnvelope();
+    error BadSize();
+    error NoNote();
+    error AlreadyDeleted();
+
+    // ---- events ----
+    event VaultInitialized(address indexed owner, uint8 mode, uint64 createdAt);
+    event EnvelopeUpdated(address indexed owner, uint8 mode, uint32 version, uint64 updatedAt);
+    event NoteCreated(address indexed author, uint256 indexed index, uint64 createdAt);
+    event NoteHiddenChanged(address indexed author, uint256 indexed index, bool hidden);
+    event NoteDeleted(address indexed author, uint256 indexed index);
+
+    // --------------------------------------------------------------------- vault
+
+    /// @notice One-time vault initialization.
+    function initVault(uint8 mode, bytes calldata envelope) external {
+        _initVault(mode, envelope);
+    }
+
+    /// @notice Convenience: create the vault and the first note in a single transaction.
+    function initVaultAndCreateNote(uint8 mode, bytes calldata envelope, bytes calldata data)
+        external
+        returns (uint256 index)
+    {
+        _initVault(mode, envelope);
+        index = _pushNote(data);
+    }
+
+    /// @notice Re-wrap the same master key (password or mode change).
+    ///         The master key itself doesn't change — old notes remain readable.
+    ///         The old envelope stays in calldata history forever: if it was ever
+    ///         wrapped with a weak password, it can be brute-forced from history
+    ///         even after changing it.
+    function updateEnvelope(uint8 mode, bytes calldata envelope) external {
+        if (_vaults[msg.sender].mode == KeyMode.Unset) revert NoVault();
+        Vault storage v = _setVault(mode, envelope);
+        emit EnvelopeUpdated(msg.sender, mode, v.version, v.updatedAt);
+    }
+
+    function _initVault(uint8 mode, bytes calldata envelope) private {
+        if (_vaults[msg.sender].mode != KeyMode.Unset) revert VaultExists();
+        _setVault(mode, envelope);
+        totalUsers++;
+        emit VaultInitialized(msg.sender, mode, uint64(block.timestamp));
+    }
+
+    function _setVault(uint8 mode, bytes calldata envelope) private returns (Vault storage v) {
+        if (mode != uint8(KeyMode.Signature) && mode != uint8(KeyMode.Passphrase)) revert BadMode();
+        if (envelope.length == 0 || envelope.length > MAX_ENVELOPE_BYTES) revert BadEnvelope();
+        v = _vaults[msg.sender];
+        v.mode      = KeyMode(mode);
+        v.envelope  = envelope;
+        v.version  += 1;                          // version == 1 after init, increases from there
+        v.updatedAt = uint64(block.timestamp);
+        if (v.createdAt == 0) v.createdAt = uint64(block.timestamp);
+    }
+
+    function hasVault(address owner) external view returns (bool) {
+        return _vaults[owner].mode != KeyMode.Unset;
+    }
+
+    function getVault(address owner)
+        external view
+        returns (uint8 mode, uint32 version, uint64 createdAt, uint64 updatedAt, bytes memory envelope)
+    {
+        Vault storage v = _vaults[owner];
+        return (uint8(v.mode), v.version, v.createdAt, v.updatedAt, v.envelope);
+    }
+
+    // --------------------------------------------------------------------- notes
+
+    function createNote(bytes calldata data) external returns (uint256 index) {
+        index = _pushNote(data);
+    }
+
+    function _pushNote(bytes calldata data) private returns (uint256 index) {
+        if (_vaults[msg.sender].mode == KeyMode.Unset) revert NoVault();
+        if (data.length == 0 || data.length > MAX_NOTE_BYTES) revert BadSize();
+        index = _notes[msg.sender].length;
+        _notes[msg.sender].push(Note(uint64(block.timestamp), false, false, data));
+        totalNotes++;
+        emit NoteCreated(msg.sender, index, uint64(block.timestamp));
+    }
+
+    /// @notice Backward compatibility: equivalent to setHidden(index, true).
+    function hideNote(uint256 index) external {
+        _setHidden(index, true);
+    }
+
+    /// @notice Hide/show a note (reversible). The flag is cosmetic, data is not hidden.
+    function setHidden(uint256 index, bool hidden_) external {
+        _setHidden(index, hidden_);
+    }
+
+    function _setHidden(uint256 index, bool hidden_) private {
+        Note[] storage arr = _notes[msg.sender];
+        if (index >= arr.length) revert NoNote();
+        Note storage n = arr[index];
+        if (n.deleted) revert AlreadyDeleted();
+        n.hidden = hidden_;
+        emit NoteHiddenChanged(msg.sender, index, hidden_);
+    }
+
+    /// @notice Wipe the ciphertext from current state (gas refund). The index remains.
+    ///         Transaction history is NOT affected — data stays there forever.
+    function deleteNote(uint256 index) external {
+        Note[] storage arr = _notes[msg.sender];
+        if (index >= arr.length) revert NoNote();
+        Note storage n = arr[index];
+        if (n.deleted) revert AlreadyDeleted();
+        n.deleted = true;
+        delete n.data;
+        emit NoteDeleted(msg.sender, index);
+    }
+
+    function noteCount(address owner) external view returns (uint256) {
+        return _notes[owner].length;
+    }
+
+    function getNote(address owner, uint256 index)
+        external view
+        returns (uint64 createdAt, bool hidden, bool deleted, bytes memory data)
+    {
+        if (index >= _notes[owner].length) revert NoNote();
+        Note storage n = _notes[owner][index];
+        return (n.createdAt, n.hidden, n.deleted, n.data);
+    }
+
+    function getNotes(address owner, uint256 offset, uint256 limit)
+        external view
+        returns (Note[] memory page)
+    {
+        uint256 len = _notes[owner].length;
+        if (offset >= len) return new Note[](0);
+        uint256 remaining = len - offset;               // safe: offset < len
+        uint256 count = limit < remaining ? limit : remaining;
+        if (count > MAX_PAGE) count = MAX_PAGE;
+        page = new Note[](count);
+        for (uint256 i = 0; i < count; i++) {
+            page[i] = _notes[owner][offset + i];        // offset + i < len, no overflow
+        }
+    }
+}
